@@ -2,7 +2,7 @@ name: Crunchyroll News Bot
 
 on:
   schedule:
-    - cron: '*/10 * * * *' # Runs every 10 minutes
+    - cron: '*/15 * * * *' # Runs every 15 minutes
   workflow_dispatch:       # Allows manual run
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
 
       # 2. Download the 'sent_posts.txt' file from the previous run
       - name: Download sent posts cache
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4 # <-- UPDATED TO v4
         with:
           name: sent-posts-cache
           path: .
@@ -46,7 +46,7 @@ jobs:
 
       # 7. Upload the updated 'sent_posts.txt' file for the next run
       - name: Upload sent posts cache
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4 # <-- UPDATED TO v4
         with:
           name: sent-posts-cache
           path: sent_posts.txt
