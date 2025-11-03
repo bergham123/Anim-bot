@@ -1,82 +1,192 @@
-import feedparser
-import telegram
-import asyncio
+import requests
+from bs4 import BeautifulSoup
 import os
-import time
+import logging
+from PIL import Image
+from io import BytesIO
 
-# --- CONFIGURATION ---
-# We will load these from environment variables for security
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-RSS_FEED_URL = "https://www.animenewsnetwork.com/news/rss.xml"
+# --- Config ---
+# Load secrets from environment variables for security
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# A file to store the IDs of posts we have already sent
-SENT_POSTS_FILE = "sent_posts.txt"
+# These can stay here or also be moved to secrets
+RSS_URL = "https://cr-news-api-service.prd.crunchyrollsvc.com/v1/ar-SA/rss"
+SENT_FILE = "sent_posts.txt"
+LOGO_PATH = "logo.png"
+LOGO_MIN_WIDTH_RATIO = 0.10
+LOGO_MAX_WIDTH_RATIO = 0.20
+LOGO_MARGIN = 10
 
-# --- MAIN LOGIC ---
+# --- Headers to bypass 403 ---
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ar-SA,ar;q=0.9,en;q=0.8",
+    "Accept": "application/xml,application/xhtml+xml,text/html;q=0.9,image/webp,*/*;q=0.8",
+    "Connection": "keep-alive"
+}
 
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+# --- Load/Save sent posts ---
 def load_sent_posts():
-    """Loads the set of already sent post IDs from a file."""
-    if not os.path.exists(SENT_POSTS_FILE):
-        return set()
-    with open(SENT_POSTS_FILE, "r") as f:
-        # Using a set for fast lookups
-        return set(line.strip() for line in f)
+    # This function remains the same
+    if os.path.exists(SENT_FILE):
+        with open(SENT_FILE, "r", encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
 
-def save_sent_post(post_id):
-    """Appends a new post ID to the file."""
-    with open(SENT_POSTS_FILE, "a") as f:
-        f.write(str(post_id) + "\n")
+def save_sent_post(title):
+    # This function remains the same
+    with open(SENT_FILE, "a", encoding="utf-8") as f:
+        f.write(title + "\n")
 
-async def check_and_send_news():
-    """Checks the RSS feed for new entries and sends them to Telegram."""
-    if not BOT_TOKEN or not CHANNEL_ID:
-        print("Error: BOT_TOKEN or CHANNEL_ID not set in environment variables.")
-        return
 
-    print("Checking for news...")
-    bot = telegram.Bot(token=BOT_TOKEN)
-    sent_posts = load_sent_posts()
+# --- Shorten description ---
+def shorten_text(text, words=20):
+    # This function remains the same
+    w = text.split()
+    short = ' '.join(w[:words])
+    return short + "..." if len(w) > words else short
 
+
+# --- Add logo automatically resized (top-right) ---
+def add_logo_to_image(image_url):
+    # This function remains the same
     try:
-        # Parse the RSS feed
-        news_feed = feedparser.parse(RSS_FEED_URL)
-        
-        # We check the latest 5 entries to avoid missing any
-        for entry in news_feed.entries[:5]:
-            post_id = entry.id  # Using the unique ID from the RSS feed
+        response = requests.get(image_url, headers=HEADERS)
+        response.raise_for_status()
+        post_image = Image.open(BytesIO(response.content)).convert("RGBA")
+        logo = Image.open(LOGO_PATH).convert("RGBA")
 
-            # If we haven't sent this post yet, send it now
-            if post_id not in sent_posts:
-                print(f"New post found: {entry.title}")
-                
-                # Format the message for Telegram
-                # Using Markdown for a nice link format
-                message = f"*{entry.title}*\n\n[Read more]({entry.link})"
-                
-                try:
-                    await bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=message,
-                        parse_mode='Markdown'
-                    )
-                    print(f"Successfully sent to Telegram: {entry.title}")
-                    
-                    # Save the ID so we don't send it again
-                    save_sent_post(post_id)
-                    sent_posts.add(post_id) # Add to our current set too
-                    
-                    # Wait a moment between posts to avoid rate limits
-                    await asyncio.sleep(3)
-                except Exception as e:
-                    print(f"Failed to send message to Telegram: {e}")
+        pw, ph = post_image.size
+
+        lw = int(pw * LOGO_MIN_WIDTH_RATIO) if pw < 600 else int(pw * LOGO_MAX_WIDTH_RATIO)
+        logo_ratio = lw / logo.width
+        lh = int(logo.height * logo_ratio)
+        logo = logo.resize((lw, lh), Image.LANCZOS)
+
+        position = (pw - lw - LOGO_MARGIN, LOGO_MARGIN)
+        post_image.paste(logo, position, logo)
+
+        output = BytesIO()
+        post_image.save(output, format="PNG")
+        output.seek(0)
+        return output
+    except Exception as e:
+        logging.error(f"Error adding logo: {e}")
+        return None
+
+
+# --- Fetch latest post ---
+def get_latest_post():
+    # This function remains the same
+    try:
+        response = requests.get(RSS_URL, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "xml")
+        item = soup.find("item")
+        if not item:
+            logging.warning("No items found in RSS feed.")
+            return None
+
+        title = item.title.text.strip() if item.title else "بدون عنوان"
+
+        description_tag = item.find("description")
+        description_text = ""
+        image_url = None
+        if description_tag:
+            desc_soup = BeautifulSoup(description_tag.text, "html.parser")
+            img_tag = desc_soup.find("img")
+            if img_tag:
+                image_url = img_tag["src"]
+                img_tag.extract()
+            description_text = shorten_text(desc_soup.get_text().strip())
+
+        if not image_url:
+            media_thumb = item.find("media:thumbnail")
+            if media_thumb and media_thumb.has_attr("url"):
+                image_url = media_thumb["url"]
+
+        return {
+            "title": title,
+            "image_url": image_url,
+            "description": description_text
+        }
 
     except Exception as e:
-        print(f"Error parsing RSS feed: {e}")
+        logging.error(f"Error fetching RSS post: {e}")
+        return None
 
-    print("Check complete.")
+
+# --- Send to Telegram ---
+def send_post(title, image_url, description):
+    # This function remains the same
+    try:
+        files = None
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": f"📰 <b>{title}</b>\n\n{description}",
+            "parse_mode": "HTML"
+        }
+
+        if image_url:
+            image_with_logo = add_logo_to_image(image_url)
+            if image_with_logo:
+                files = {"photo": ("image.png", image_with_logo)}
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+            else:
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                data = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": f"📰 <b>{title}</b>\n\n{description}",
+                    "parse_mode": "HTML"
+                }
+        else:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": f"📰 <b>{title}</b>\n\n{description}",
+                "parse_mode": "HTML"
+            }
+
+        response = requests.post(url, data=data, files=files, timeout=10).json()
+        if response.get("ok"):
+            logging.info(f"Sent: {title}")
+        else:
+            logging.error(f"Telegram error: {response}")
+    except Exception as e:
+        logging.error(f"Error sending post: {e}")
+
+
+# --- Main execution function (NO LOOP) ---
+def main():
+    logging.info("Starting bot run...")
+    
+    # Check if token and chat ID are set
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("FATAL: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set in environment variables.")
+        return
+
+    sent_posts = load_sent_posts()
+    post = get_latest_post()
+
+    if post and post["title"] not in sent_posts:
+        logging.info(f"New post found: {post['title']}")
+        send_post(post["title"], post["image_url"], post["description"])
+        save_sent_post(post["title"])
+        logging.info("Post sent and ID saved.")
+    else:
+        logging.info("No new post found or post was already sent.")
+
+    logging.info("Bot run finished.")
 
 
 if __name__ == "__main__":
-    # This makes the script runnable
-    asyncio.run(check_and_send_news())
+    main()
