@@ -23,13 +23,15 @@ def load_sent_posts():
     
     if not os.path.exists(SENT_FILE):
         logging.warning(f"'{SENT_FILE}' not found. This might be the first run.")
+        # Create the file if it doesn't exist
+        with open(SENT_FILE, "w", encoding="utf-8") as f:
+            pass
         return set()
         
     try:
         with open(SENT_FILE, "r", encoding="utf-8") as f:
             posts = set(line.strip() for line in f if line.strip())
             logging.info(f"Successfully loaded {len(posts)} sent post IDs.")
-            logging.info(f"Sent posts are: {posts}")
             return posts
     except Exception as e:
         logging.error(f"Error reading {SENT_FILE}: {e}")
@@ -63,11 +65,14 @@ def clean_description(description_html):
 # --- MAIN LOGIC ---
 
 async def check_and_send_news():
-    """Checks the RSS feed for the latest entry and sends it to Telegram."""
+    """Checks the RSS feed for new entries and sends them to Telegram."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("FATAL: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set in environment variables.")
         return
 
+    # Initialize bot inside the function
+    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    
     logging.info("===== Starting new bot run =====")
     sent_posts = load_sent_posts()
 
@@ -78,36 +83,39 @@ async def check_and_send_news():
             logging.warning("No entries found in the RSS feed.")
             return
 
-        entry = news_feed.entries[0]
-        post_id = entry.id
-        logging.info(f"Latest post found: '{entry.title}' with ID: '{post_id}'")
-
-        if post_id not in sent_posts:
-            logging.info("This post is NEW. Preparing to send...")
+        # Check all entries, not just the latest one
+        new_posts_found = False
+        for entry in news_feed.entries:
+            post_id = entry.id
             
-            image_url = None
-            if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
-                image_url = entry.media_thumbnail[0]['url']
-                logging.info(f"Found image URL: {image_url}")
+            if post_id not in sent_posts:
+                new_posts_found = True
+                logging.info(f"New post found: '{entry.title}' with ID: '{post_id}'")
+                
+                image_url = None
+                if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                    image_url = entry.media_thumbnail[0]['url']
+                    logging.info(f"Found image URL: {image_url}")
 
-            clean_desc = clean_description(entry.description)
-            short_desc = shorten_text(clean_desc, words=25)
-            caption = f"*{entry.title}*\n\n{short_desc}"
-            
-            try:
-                if image_url:
-                    await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image_url, caption=caption, parse_mode='Markdown')
-                    logging.info(f"Successfully sent photo to Telegram.")
-                else:
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode='Markdown')
-                    logging.info(f"Successfully sent text message to Telegram.")
+                clean_desc = clean_description(entry.description)
+                short_desc = shorten_text(clean_desc, words=25)
+                caption = f"*{entry.title}*\n\n{short_desc}"
                 
-                save_sent_post(post_id)
-                
-            except Exception as e:
-                logging.error(f"Failed to send message to Telegram: {e}")
-        else:
-            logging.info(f"Latest post was already sent. Nothing to do.")
+                try:
+                    if image_url:
+                        await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image_url, caption=caption, parse_mode='Markdown')
+                        logging.info(f"Successfully sent photo to Telegram.")
+                    else:
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode='Markdown')
+                        logging.info(f"Successfully sent text message to Telegram.")
+                    
+                    save_sent_post(post_id)
+                    
+                except Exception as e:
+                    logging.error(f"Failed to send message to Telegram: {e}")
+        
+        if not new_posts_found:
+            logging.info("No new posts found. Nothing to do.")
 
     except Exception as e:
         logging.error(f"Error parsing RSS feed: {e}")
@@ -116,5 +124,4 @@ async def check_and_send_news():
 
 
 if __name__ == "__main__":
-    bot = telegram.Bot(token=os.getenv("TELEGRAM_TOKEN"))
     asyncio.run(check_and_send_news())
