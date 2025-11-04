@@ -1,120 +1,106 @@
-import requests
-from bs4 import BeautifulSoup
+import feedparser
+import telegram
+import asyncio
 import os
 import logging
 
-# --- Config ---
+# --- CONFIGURATION ---
 # Load secrets from environment variables for security
+# I've used the same names as your previous script for consistency
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# RSS Feed URL
-RSS_URL = "https://cr-news-api-service.prd.crunchyrollsvc.com/v1/ar-SA/rss"
-SENT_FILE = "sent_posts.txt"
+# Your Crunchyroll RSS feed
+RSS_FEED_URL = "https://cr-news-api-service.prd.crunchyrollsvc.com/v1/ar-SA/rss"
 
-# --- Headers to bypass 403 ---
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-}
+# A file to store the IDs of posts we have already sent
+SENT_POSTS_FILE = "sent_posts.txt"
 
-# Logging
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# --- MAIN LOGIC ---
 
-# --- Load/Save sent posts ---
 def load_sent_posts():
-    if os.path.exists(SENT_FILE):
-        with open(SENT_FILE, "r", encoding="utf-8") as f:
-            return set(line.strip() for line in f if line.strip())
-    return set()
+    """Loads the set of already sent post IDs from a file."""
+    if not os.path.exists(SENT_POSTS_FILE):
+        return set()
+    with open(SENT_POSTS_FILE, "r", encoding="utf-8") as f:
+        # Using a set for fast lookups
+        return set(line.strip() for line in f)
 
-def save_sent_post(title):
-    with open(SENT_FILE, "a", encoding="utf-8") as f:
-        f.write(title + "\n")
+def save_sent_post(post_id):
+    """Appends a new post ID to the file."""
+    with open(SENT_POSTS_FILE, "a", encoding="utf-8") as f:
+        f.write(str(post_id) + "\n")
 
-
-# --- Fetch latest post ---
-def get_latest_post():
-    logging.info(f"Fetching RSS feed from: {RSS_URL}")
-    try:
-        response = requests.get(RSS_URL, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, "xml")
-        item = soup.find("item")
-        if not item:
-            logging.warning("No items found in RSS feed.")
-            return None
-
-        title = item.title.text.strip() if item.title else "بدون عنوان"
-        link = item.link.text.strip() if item.link else "#"
-        
-        logging.info(f"Found latest post: '{title}'")
-        return {
-            "title": title,
-            "link": link
-        }
-
-    except Exception as e:
-        logging.error(f"Error fetching or parsing RSS feed: {e}")
-        return None
-
-
-# --- Send to Telegram ---
-def send_post(title, link):
-    logging.info("Attempting to send post to Telegram...")
-    try:
-        # Create a simple text message with a link
-        message_text = f"📰 <b>{title}</b>\n\n[اقرأ المزيد]({link})"
-        
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false" # Show the link preview
-        }
-        
-        response = requests.post(url, json=payload, timeout=15).json()
-        
-        if response.get("ok"):
-            logging.info(f"Successfully sent to Telegram: {title}")
-            return True
-        else:
-            logging.error(f"Telegram API error: {response}")
-            return False
-            
-    except Exception as e:
-        logging.error(f"Error sending post to Telegram: {e}")
-        return False
-
-
-# --- Main execution function ---
-def main():
-    logging.info("="*20)
-    logging.info("Starting a new bot run...")
-    
+async def check_and_send_news():
+    """Checks the RSS feed for new entries and sends them to Telegram."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("FATAL: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set in environment variables.")
         return
 
+    logging.info("Checking for news...")
+    bot = telegram.Bot(token=TELEGRAM_TOKEN)
     sent_posts = load_sent_posts()
-    post = get_latest_post()
 
-    if post:
-        if post["title"] not in sent_posts:
-            logging.info(f"New post detected: '{post['title']}'")
-            success = send_post(post["title"], post["link"])
-            if success:
-                save_sent_post(post["title"])
-                logging.info("Post sent and title saved for future reference.")
-        else:
-            logging.info(f"Post '{post['title']}' already sent. Nothing to do.")
-    else:
-        logging.warning("Could not retrieve the latest post from the feed.")
+    try:
+        # Parse the RSS feed
+        news_feed = feedparser.parse(RSS_FEED_URL)
+        
+        # We check the latest 5 entries to avoid missing any
+        for entry in news_feed.entries[:5]:
+            post_id = entry.id  # Using the unique ID from the RSS feed
 
-    logging.info("Bot run finished.")
-    logging.info("="*20)
+            # If we haven't sent this post yet, send it now
+            if post_id not in sent_posts:
+                logging.info(f"New post found: {entry.title}")
+                
+                # --- Get the image URL ---
+                image_url = None
+                # feedparser puts media thumbnails in entry.media_thumbnail
+                if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                    image_url = entry.media_thumbnail[0]['url']
+                    logging.info(f"Found image URL: {image_url}")
+
+                # --- Prepare the message ---
+                caption = f"*{entry.title}*\n\n[اقرأ المزيد]({entry.link})"
+                
+                try:
+                    # --- Send the message ---
+                    if image_url:
+                        # Send as a photo with a caption
+                        await bot.send_photo(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            photo=image_url,
+                            caption=caption,
+                            parse_mode='Markdown'
+                        )
+                        logging.info(f"Successfully sent photo to Telegram: {entry.title}")
+                    else:
+                        # If no image, send as a text message
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=caption,
+                            parse_mode='Markdown'
+                        )
+                        logging.info(f"Successfully sent text message to Telegram: {entry.title}")
+                    
+                    # Save the ID so we don't send it again
+                    save_sent_post(post_id)
+                    sent_posts.add(post_id)
+                    
+                    # Wait a moment between posts to avoid rate limits
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    logging.error(f"Failed to send message to Telegram: {e}")
+
+    except Exception as e:
+        logging.error(f"Error parsing RSS feed: {e}")
+
+    logging.info("Check complete.")
 
 
 if __name__ == "__main__":
-    main()
+    # This makes the script runnable
+    asyncio.run(check_and_send_news())
