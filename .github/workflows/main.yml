@@ -12,9 +12,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT_FOR_COMMIT }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -40,11 +41,19 @@ jobs:
 
       - name: Commit & push if changed
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --global user.name  'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add data global_index sent_videos.txt || true
+
+          git add -A
+
           if git diff --staged --quiet; then
             echo "No changes to commit."
-          else
-            git commit -m "bot: update data/, global_index/ and sent_videos.txt"
-            git push
+            exit 0
+          fi
+
+          git commit -m "bot: update data/, global_index/ and sent_videos.txt"
+
+          # Rebase in case remote got new commits
+          git pull --rebase --autostash origin "$GITHUB_REF_NAME" || true
+          git push origin HEAD:"$GITHUB_REF_NAME"
