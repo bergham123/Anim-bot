@@ -1,346 +1,470 @@
-import feedparser
-import telegram
-import asyncio
+# bot.py
 import os
-import logging
-from bs4 import BeautifulSoup
-from PIL import Image
-from io import BytesIO
-import requests
 import json
-from datetime import datetime, timezone
+import asyncio
+import logging
+import calendar
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
-# --- CONFIG ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+import feedparser
+from bs4 import BeautifulSoup
+
+import requests
+import telegram
+from telegram import InputMediaPhoto
+
+# ====================
+# CONFIG
+# ====================
+TZ = ZoneInfo("Africa/Casablanca")
+
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Crunchyroll
+# Sources
 CRUNCHYROLL_RSS_URL = "https://cr-news-api-service.prd.crunchyrollsvc.com/v1/ar-SA/rss"
-CRUNCHYROLL_SENT_FILE = "sent_posts.txt"
 
 # YouTube
-CHANNEL_ID = "UC1WGYjPeHHc_3nRXqbW3OcQ"
-YOUTUBE_RSS_URL = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
-YOUTUBE_SENT_FILE = "sent_videos.txt"
+CHANNEL_ID       = "UC1WGYjPeHHc_3nRXqbW3OcQ"
+YOUTUBE_RSS_URL  = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
+YOUTUBE_SENT_FILE = Path("sent_videos.txt")
 
-# Archive config (Africa/Casablanca day, <year>/<D-M>.json e.g. 2025/8-11.json)
-ARCHIVE_TZ = ZoneInfo("Africa/Casablanca")
-ARCHIVE_ROOT = "."
+# Paths
+DATA_BASE       = Path("data")                 # data/YYYY/MM/DD-MM.json
+GLOBAL_INDEX    = Path("global_index")         # index_1.json, pagination.json, stats.json
 
-# Logo overlay
-LOGO_PATH = "logo.png"
-LOGO_MIN_WIDTH_RATIO = 0.10
-LOGO_MAX_WIDTH_RATIO = 0.20
-LOGO_MARGIN = 10
+# Global Index settings
+GLOBAL_PAGE_SIZE = 500
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/140.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ar-SA,ar;q=0.9,en;q=0.8",
-    "Accept": "application/xml,application/xhtml+xml,text/html;q=0.9,image/webp,*/*;q=0.8",
-    "Connection": "keep-alive"
-}
-
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ---------- Helpers ----------
-def local_today():
-    return datetime.now(ARCHIVE_TZ).date()
+# ====================
+# Utilities
+# ====================
+def now_local() -> datetime:
+    return datetime.now(TZ)
 
-def to_local_date_from_utc(dt_utc):
-    return dt_utc.astimezone(ARCHIVE_TZ).date()
+def to_local_iso(dt_struct) -> str | None:
+    """Convert feedparser *_parsed to ISO tz-aware Africa/Casablanca."""
+    if not dt_struct:
+        return None
+    try:
+        dt_utc = datetime.fromtimestamp(calendar.timegm(dt_struct), tz=timezone.utc)
+        return dt_utc.astimezone(TZ).isoformat()
+    except Exception:
+        return None
 
-def path_for_date(local_date):
-    year_dir = os.path.join(ARCHIVE_ROOT, str(local_date.year))
-    os.makedirs(year_dir, exist_ok=True)
-    d_m = f"{local_date.day}-{local_date.month}"  # no leading zeros -> 8-11.json
-    return os.path.join(year_dir, f"{d_m}.json")
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-def load_json(path, date_iso):
-    if not os.path.exists(path):
-        return {"date": date_iso, "items": []}
+def daily_path(dt: datetime) -> Path:
+    y, m, d = dt.year, dt.month, dt.day
+    out_dir = DATA_BASE / f"{y}" / f"{m:02d}"
+    ensure_dir(out_dir)
+    return out_dir / f"{d:02d}-{m:02d}.json"   # example: data/2025/11/09-11.json
+
+def load_json_list(path: Path) -> list:
+    if not path.exists():
+        return []
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, list) else []
     except Exception as e:
-        logging.error(f"Failed to load JSON {path}: {e}")
-        return {"date": date_iso, "items": []}
+        logging.error(f"Failed reading {path}: {e}")
+        return []
 
-def save_json(path, data):
+def save_json_list(path: Path, data: list):
     try:
+        ensure_dir(path.parent)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        logging.info(f"Archived to {path}")
     except Exception as e:
-        logging.error(f"Failed to write JSON {path}: {e}")
+        logging.error(f"Failed writing {path}: {e}")
 
-def today_archive_ids_for_source(source_name):
-    """اقرأ ملف اليوم الموجود وخذ IDs الخاصة بالمصدر حتى لا نعيد الإرسال."""
-    d = local_today()
-    path = path_for_date(d)
-    data = load_json(path, d.isoformat())
-    ids = {it.get("id") for it in data.get("items", []) if it.get("source") == source_name}
-    return ids
-
-def archive_sent_item(item, dt_utc):
-    """Append the sent item (only after successful Telegram send)."""
-    local_date = to_local_date_from_utc(dt_utc)
-    path = path_for_date(local_date)
-    data = load_json(path, local_date.isoformat())
-    existing = {it.get("id") for it in data["items"]}
-    if item.get("id") not in existing:
-        data["items"].append(item)
-        data["items"].sort(key=lambda x: x.get("published_at", ""), reverse=True)
-        save_json(path, data)
-    else:
-        logging.info("Item already archived for this day; skipping.")
-
-def clean_text(html_or_text):
-    if not html_or_text:
-        return ""
-    soup = BeautifulSoup(html_or_text, "html.parser")
-    return soup.get_text().strip()
-
-def shorten_text(text, words=25):
+def shorten_words(text: str, n=20) -> str:
     if not text:
         return ""
     w = text.split()
-    short = " ".join(w[:words])
-    return short + "..." if len(w) > words else short
+    return " ".join(w[:n])
 
-def load_first_sent_post(sent_file):
-    if not os.path.exists(sent_file):
-        with open(sent_file, "w", encoding="utf-8"):
-            pass
-        return None
-    try:
-        with open(sent_file, "r", encoding="utf-8") as f:
-            line = f.readline().strip()
-            return line if line else None
-    except Exception as e:
-        logging.error(f"Error reading {sent_file}: {e}")
-        return None
-
-def save_sent_post(post_id, sent_file):
-    try:
-        prior = ""
-        if os.path.exists(sent_file):
-            with open(sent_file, "r", encoding="utf-8") as f:
-                prior = f.read()
-        with open(sent_file, "w", encoding="utf-8") as f:
-            f.write(str(post_id) + "\n")
-            if prior:
-                f.write(prior)
-    except Exception as e:
-        logging.error(f"Error writing {sent_file}: {e}")
-
-def add_logo_to_image(image_url):
-    try:
-        if not os.path.exists(LOGO_PATH):
-            return None
-        r = requests.get(image_url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        post_image = Image.open(BytesIO(r.content)).convert("RGBA")
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        pw, ph = post_image.size
-        lw = int(pw * (LOGO_MIN_WIDTH_RATIO if pw < 600 else LOGO_MAX_WIDTH_RATIO))
-        logo = logo.resize((lw, int(logo.height * (lw / logo.width))), Image.LANCZOS)
-        pos = (pw - logo.width - LOGO_MARGIN, LOGO_MARGIN)
-        post_image.paste(logo, pos, logo)
-        out = BytesIO()
-        post_image.save(out, format="PNG")
-        out.seek(0)
-        return out
-    except Exception as e:
-        logging.error(f"Logo add failed: {e}")
-        return None
-
-def parse_entry_datetime(entry):
-    if hasattr(entry, "published_parsed") and entry.published_parsed:
-        return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-    if hasattr(entry, "updated_parsed") and entry.updated_parsed:
-        return datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
-    return datetime.now(timezone.utc)
-
-# ---------- Core routine to send a list of items ----------
-async def send_items(bot, items, sent_file, source_name):
-    """
-    يرسل كل العناصر غير المُرسَلة (حسب sent_file + JSON اليوم) بترتيب قديم -> جديد.
-    كل عنصر يُؤرشف فقط بعد نجاح الإرسال.
-    """
-    # IDs الموجودة في JSON اليوم لهذا المصدر
-    archived_ids_today = today_archive_ids_for_source(source_name)
-    # ID الأحدث في ملف التتبع (نحافظ عليه كـ fallback قديم)
-    first_sent = load_first_sent_post(sent_file)
-
-    # فلترة العناصر غير المُرسلة
-    def is_unsent(item):
-        iid = str(item["id"])
-        if iid in archived_ids_today:
-            return False
-        if first_sent and iid == str(first_sent):
-            # هذا يطابق آخر ما أرسلناه تاريخياً كأحدث عنصر؛ لكن قد توجد عناصر أقدم غير مرسلة.
-            # نعتمد على JSON اليوم لمنع التكرار، ونبقي هذا الشرط فقط كـ حماية عند بداية اليوم.
-            return False
-        return True
-
-    unsent = [it for it in items if is_unsent(it)]
-
-    # إرسال بالترتيب من الأقدم إلى الأحدث
-    unsent.sort(key=lambda x: x["published_at"])
-
-    for it in unsent:
-        caption = it["caption"]
+# ====================
+# RSS Field Extraction
+# ====================
+def extract_image(entry) -> str | None:
+    # 1) media_thumbnail
+    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
         try:
-            if it.get("image_url"):
-                img_with_logo = add_logo_to_image(it["image_url"])
-                if img_with_logo:
-                    await bot.send_photo(TELEGRAM_CHAT_ID, photo=img_with_logo, caption=caption, parse_mode="Markdown")
-                else:
-                    await bot.send_photo(TELEGRAM_CHAT_ID, photo=it["image_url"], caption=caption, parse_mode="Markdown")
-            else:
-                await bot.send_message(TELEGRAM_CHAT_ID, text=caption, parse_mode="Markdown")
+            return entry.media_thumbnail[0].get("url") or entry.media_thumbnail[0]["url"]
+        except Exception:
+            pass
+    # 2) find <img> in description
+    html = getattr(entry, "description", None)
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        img = soup.find("img")
+        if img and img.has_attr("src"):
+            return img["src"]
+    return None
 
-            # بعد النجاح: حدّث ملف التتبع ليصبح آخر المُرسَل (الأحدث من حيث الـfeed سيأتي بالآخر)
-            save_sent_post(it["id"], sent_file)
+def extract_categories(entry) -> list:
+    cats = []
+    tags = getattr(entry, "tags", None)
+    if tags:
+        for t in tags:
+            term = getattr(t, "term", None)
+            if term:
+                cats.append(str(term))
+    return cats
 
-            # أرشف
-            archive_sent_item(
-                {
-                    "id": str(it["id"]),
-                    "source": source_name,
-                    "title": it["title"],
-                    "url": it["url"],
-                    "image_url": it.get("image_url"),
-                    "description_text": it["desc_text"],
-                    "description_html": it["desc_html"],
-                    "published_at": it["published_at"],
-                    "lang": it.get("lang", "ar"),
-                },
-                datetime.fromisoformat(it["published_at"].replace("Z","+00:00")) if it["published_at"].endswith("Z") else datetime.fromisoformat(it["published_at"])
-            )
+def extract_author(entry) -> str | None:
+    if hasattr(entry, "author") and entry.author:
+        return entry.author
+    if hasattr(entry, "authors") and entry.authors:
+        try:
+            return entry.authors[0].get("name")
+        except Exception:
+            return None
+    return None
 
+def extract_language(feed) -> str | None:
+    # Try feed-level language
+    if hasattr(feed, "feed"):
+        lang = feed.feed.get("language") or feed.feed.get("lang")
+        return lang
+    return None
+
+def build_full_record(entry, feed_lang_default: str | None = None) -> dict:
+    """Store ALL fields required inside the daily file."""
+    rec_id = getattr(entry, "id", None) or getattr(entry, "link", None) or getattr(entry, "title", None)
+    title  = getattr(entry, "title", "") or ""
+    url    = getattr(entry, "link", "") or ""
+
+    description_full = getattr(entry, "description", "") or ""   # HTML as-is
+    image  = extract_image(entry)
+    cats   = extract_categories(entry)
+    published_iso = to_local_iso(getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None))
+    author = extract_author(entry)
+    language = getattr(entry, "language", None) or feed_lang_default or "ar-SA"
+
+    return {
+        "id": str(rec_id) if rec_id else None,
+        "title": title,
+        "description_full": description_full,
+        "image": image,
+        "categories": cats,
+        "author": author,
+        "published": published_iso,
+        "language": language,
+        "url": url
+    }
+
+# ====================
+# Persist Daily News
+# ====================
+def save_full_news_of_today(entries, feed_meta=None):
+    """
+    - Build full records (all fields).
+    - Append only NEW ones (by id, fallback url).
+    - Return (added_records_list, path_str).
+    """
+    today = now_local()
+    path = daily_path(today)
+    existing = load_json_list(path)
+
+    seen_ids  = { str(x.get("id"))  for x in existing if x.get("id") }
+    seen_urls = { str(x.get("url")) for x in existing if x.get("url") }
+
+    feed_lang_default = extract_language(feed_meta) if feed_meta else None
+
+    added = []
+    for e in entries:
+        rec = build_full_record(e, feed_lang_default)
+        rid = rec.get("id")
+        rurl = rec.get("url")
+        if (rid and str(rid) in seen_ids) or (rurl and str(rurl) in seen_urls):
+            continue
+        existing.append(rec)
+        added.append(rec)
+        if rid:  seen_ids.add(str(rid))
+        if rurl: seen_urls.add(str(rurl))
+
+    if added:
+        save_json_list(path, existing)
+    return added, str(path)
+
+# ====================
+# Manifests (month/year)
+# ====================
+def update_month_manifest(dt: datetime):
+    y, m = dt.year, dt.month
+    month_dir = DATA_BASE / f"{y}" / f"{m:02d}"
+    ensure_dir(month_dir)
+    manifest_path = month_dir / "month_manifest.json"
+
+    # list all DD-MM.json files
+    days = {}
+    for p in sorted(month_dir.glob("*.json")):
+        if p.name == "month_manifest.json":
+            continue
+        day_key = p.stem  # "DD-MM"
+        days[day_key.split("-")[0]] = str(p.as_posix())
+
+    manifest = {
+        "year": str(y),
+        "month": f"{m:02d}",
+        "days": dict(sorted(days.items(), key=lambda kv: kv[0], reverse=True))
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+def update_year_manifest(dt: datetime):
+    y = dt.year
+    year_dir = DATA_BASE / f"{y}"
+    ensure_dir(year_dir)
+    manifest_path = year_dir / "year_manifest.json"
+
+    months = {}
+    for p in sorted(year_dir.glob("[0-1][0-9]")):
+        m = p.name
+        months[m] = f"{(p / 'month_manifest.json').as_posix()}"
+
+    manifest = {
+        "year": str(y),
+        "months": dict(sorted(months.items(), key=lambda kv: kv[0], reverse=True))
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+# ====================
+# Global Index (search-friendly)
+#   - Split files every 500 items: index_1.json, index_2.json, ...
+#   - Each item: title, image, url, categories
+#   - pagination.json: { total_articles, files: [...] }
+#   - stats.json: { total_articles, added_today, last_update }
+# ====================
+def gi_paths():
+    ensure_dir(GLOBAL_INDEX)
+    pag_path  = GLOBAL_INDEX / "pagination.json"
+    stats_path= GLOBAL_INDEX / "stats.json"
+    return pag_path, stats_path
+
+def gi_load_pagination():
+    pag_path, _ = gi_paths()
+    if not pag_path.exists():
+        return {"total_articles": 0, "files": []}
+    with open(pag_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def gi_save_pagination(pag):
+    pag_path, _ = gi_paths()
+    with open(pag_path, "w", encoding="utf-8") as f:
+        json.dump(pag, f, ensure_ascii=False, indent=2)
+
+def gi_save_stats(total_articles: int, added_today: int):
+    _, stats_path = gi_paths()
+    stats = {
+        "total_articles": total_articles,
+        "added_today": added_today,
+        "last_update": now_local().isoformat()
+    }
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+def gi_append_records(new_records: list):
+    """
+    Append slim records to the latest global_index/index_N.json
+    Each record requires: title, image, url, categories
+    """
+    if not new_records:
+        return
+
+    pag = gi_load_pagination()
+
+    # Determine current file
+    if not pag["files"]:
+        current_idx = 1
+        current_file = GLOBAL_INDEX / f"index_{current_idx}.json"
+        save_json_list(current_file, [])
+        pag["files"].append(f"index_{current_idx}.json")
+    else:
+        current_file = GLOBAL_INDEX / pag["files"][-1]
+        # in case missing on disk
+        if not current_file.exists():
+            save_json_list(current_file, [])
+
+    # Load current page content
+    items = load_json_list(current_file)
+
+    # Rotate if needed
+    if len(items) >= GLOBAL_PAGE_SIZE:
+        next_idx = len(pag["files"]) + 1
+        current_file = GLOBAL_INDEX / f"index_{next_idx}.json"
+        save_json_list(current_file, [])
+        pag["files"].append(f"index_{next_idx}.json")
+        items = []
+
+    # Append
+    items.extend(new_records)
+    save_json_list(current_file, items)
+
+    # Save pagination + stats
+    total = (pag.get("total_articles") or 0) + len(new_records)
+    pag["total_articles"] = total
+    gi_save_pagination(pag)
+    gi_save_stats(total_articles=total, added_today=len(new_records))
+
+def convert_full_to_slim(records: list) -> list:
+    """
+    Convert full records (daily saved) to slim records for global index.
+    Keep: title, image, url, categories
+    """
+    out = []
+    for r in records:
+        out.append({
+            "title": r.get("title"),
+            "image": r.get("image"),
+            "url": r.get("url"),
+            "categories": r.get("categories") or []
+        })
+    return out
+
+# ====================
+# Telegram Senders
+# ====================
+async def send_crunchyroll_album(bot: telegram.Bot, new_records: list):
+    """
+    Send up to 4 NEW items as an album (title + image only), no links.
+    If no images available, send one text message with titles only.
+    """
+    if not new_records:
+        return
+
+    # Sort by published (desc) if available, else as-is
+    def keypub(r):
+        try:
+            return datetime.fromisoformat(r.get("published")) if r.get("published") else datetime.min.replace(tzinfo=TZ)
+        except Exception:
+            return datetime.min.replace(tzinfo=TZ)
+
+    candidates = sorted(new_records, key=keypub, reverse=True)
+
+    # Only items with images for the album
+    photos = []
+    for rec in candidates:
+        if rec.get("image"):
+            caption = rec.get("title") or ""
+            photos.append(InputMediaPhoto(media=rec["image"], caption=caption))
+        if len(photos) >= 4:
+            break
+
+    # If we have photos, send as one media group (single message album)
+    if photos:
+        try:
+            await bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=photos)
+            return
         except Exception as e:
-            logging.error(f"Failed to send {source_name} item: {e}")
+            logging.error(f"send_media_group failed: {e}")
 
-# ---------- Crunchyroll ----------
-async def check_and_send_crunchyroll_news(bot):
-    logging.info("===== Checking Crunchyroll =====")
+    # Fallback: send a compact text list (no links)
+    lines = []
+    for rec in candidates[:4]:
+        lines.append(f"• {rec.get('title')}")
+    if lines:
+        text = "📰 أحدث أخبار الأنمي من Crunchyroll\n\n" + "\n".join(lines)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+
+async def send_youtube_if_new(bot: telegram.Bot):
+    """
+    Send latest YouTube video if it's new.
+    - Not stored in data/
+    - ID saved to sent_videos.txt (top line)
+    """
+    feed = feedparser.parse(YOUTUBE_RSS_URL)
+    if not feed.entries:
+        return
+
+    entry = feed.entries[0]
+    vid = getattr(entry, "yt_videoid", None) or getattr(entry, "id", None)
+    title = getattr(entry, "title", "")
+    url   = getattr(entry, "link", "")
+    thumb = None
+    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+        thumb = entry.media_thumbnail[0].get("url")
+
+    # read first line of sent_videos
+    if not YOUTUBE_SENT_FILE.exists():
+        YOUTUBE_SENT_FILE.write_text("", encoding="utf-8")
+        last = None
+    else:
+        with open(YOUTUBE_SENT_FILE, "r", encoding="utf-8") as f:
+            last = f.readline().strip() or None
+
+    # already sent?
+    if last and vid and vid == last:
+        return
+
+    # send
+    caption = f"🎥 {title}\nشاهد على يوتيوب:\n{url}"
     try:
-        feed = feedparser.parse(CRUNCHYROLL_RSS_URL)
-        if not feed.entries:
-            logging.warning("No Crunchyroll entries.")
-            return
-
-        today_local = local_today()
-        items_today = []
-        for entry in feed.entries:
-            dt_utc = parse_entry_datetime(entry)
-            if to_local_date_from_utc(dt_utc) != today_local:
-                continue
-
-            post_id = str(getattr(entry, "id", getattr(entry, "link", "")))
-            title = entry.title
-            url = getattr(entry, "link", None)
-            desc_html = getattr(entry, "description", "")
-            desc_text = clean_text(desc_html)
-
-            image_url = None
-            if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-                image_url = entry.media_thumbnail[0].get("url")
-            if not image_url and desc_html:
-                img = BeautifulSoup(desc_html, "html.parser").find("img")
-                if img and img.has_attr("src"):
-                    image_url = img["src"]
-
-            caption = f"📰 *{title}*\n\n{shorten_text(desc_text, 25)}"
-
-            items_today.append({
-                "id": post_id,
-                "title": title,
-                "url": url,
-                "image_url": image_url,
-                "desc_text": desc_text,
-                "desc_html": desc_html,
-                "published_at": dt_utc.isoformat(),
-                "caption": caption,
-                "lang": "ar",
-            })
-
-        if not items_today:
-            logging.info("No Crunchyroll items for today.")
-            return
-
-        await send_items(bot, items_today, CRUNCHYROLL_SENT_FILE, "crunchyroll")
-
+        if thumb:
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=thumb, caption=caption)
+        else:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption)
     except Exception as e:
-        logging.error(f"Crunchyroll feed error: {e}")
+        logging.error(f"Failed to send YouTube: {e}")
+        return
 
-    logging.info("===== Done Crunchyroll =====")
-
-# ---------- YouTube ----------
-async def check_and_send_youtube_video(bot):
-    logging.info("===== Checking YouTube =====")
+    # persist id (prepend)
     try:
-        feed = feedparser.parse(YOUTUBE_RSS_URL)
-        if not feed.entries:
-            logging.warning("No YouTube entries.")
-            return
-
-        today_local = local_today()
-        items_today = []
-        for entry in feed.entries:
-            dt_utc = parse_entry_datetime(entry)
-            if to_local_date_from_utc(dt_utc) != today_local:
-                continue
-
-            video_id = str(getattr(entry, "yt_videoid", getattr(entry, "link", "")))
-            title = entry.title
-            url = getattr(entry, "link", None)
-            thumb = entry.media_thumbnail[0]["url"] if hasattr(entry, "media_thumbnail") and entry.media_thumbnail else None
-            desc_html = getattr(entry, "media_description", getattr(entry, "description", ""))
-            desc_text = clean_text(desc_html)
-
-            caption = f"🎬 *{title}*\n\n{shorten_text(desc_text, 25)}\n\n[Watch on YouTube]({url})"
-
-            items_today.append({
-                "id": video_id,
-                "title": title,
-                "url": url,
-                "image_url": thumb,
-                "desc_text": desc_text,
-                "desc_html": desc_html,
-                "published_at": dt_utc.isoformat(),
-                "caption": caption,
-                "lang": "ar",
-            })
-
-        if not items_today:
-            logging.info("No YouTube items for today.")
-            return
-
-        await send_items(bot, items_today, YOUTUBE_SENT_FILE, "youtube")
-
+        old = ""
+        if YOUTUBE_SENT_FILE.exists():
+            old = YOUTUBE_SENT_FILE.read_text(encoding="utf-8")
+        with open(YOUTUBE_SENT_FILE, "w", encoding="utf-8") as f:
+            f.write((vid or "") + "\n")
+            if old:
+                f.write(old)
     except Exception as e:
-        logging.error(f"YouTube feed error: {e}")
+        logging.error(f"Failed updating {YOUTUBE_SENT_FILE}: {e}")
 
-    logging.info("===== Done YouTube =====")
-
-# ---------- Main ----------
-async def check_and_send_content():
+# ====================
+# Main Routine
+# ====================
+async def run():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("FATAL: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set.")
         return
+
     bot = telegram.Bot(token=TELEGRAM_TOKEN)
-    logging.info("===== Bot run start =====")
-    await check_and_send_crunchyroll_news(bot)
-    await check_and_send_youtube_video(bot)
-    logging.info("===== Bot run end =====")
+
+    # 1) Fetch Crunchyroll
+    news_feed = feedparser.parse(CRUNCHYROLL_RSS_URL)
+    if news_feed.entries:
+        # Save full records of TODAY (all fields)
+        added_records, day_path = save_full_news_of_today(news_feed.entries, feed_meta=news_feed)
+        logging.info(f"Crun: added {len(added_records)} new record(s) to {day_path}")
+
+        # Send album (latest up to 4 new items) – title + image only (no links)
+        await send_crunchyroll_album(bot, added_records)
+
+        # Update manifests for month / year
+        today = now_local()
+        update_month_manifest(today)
+        update_year_manifest(today)
+
+        # Update global index (slim: title, image, url, categories) with pagination
+        slim = convert_full_to_slim(added_records)
+        gi_append_records(slim)
+
+    else:
+        logging.warning("No entries in Crunchyroll feed.")
+
+    # 2) YouTube (send if new; no data/ persistence)
+    await send_youtube_if_new(bot)
 
 if __name__ == "__main__":
-    asyncio.run(check_and_send_content())
-s
+    asyncio.run(run())
