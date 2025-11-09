@@ -44,14 +44,14 @@ GLOBAL_PAGE_SIZE = 500
 
 # Logo overlay settings
 LOGO_PATH = "logo.png"
-LOGO_MIN_WIDTH_RATIO = 0.10  # 10% من عرض الصورة للصورة الصغيرة
-LOGO_MAX_WIDTH_RATIO = 0.20  # 20% من عرض الصورة للصورة الكبيرة
-LOGO_MARGIN = 10             # هامش من أعلى اليمين بالبكسل
+LOGO_MIN_WIDTH_RATIO = 0.10  # 10% of image width for small images
+LOGO_MAX_WIDTH_RATIO = 0.20  # 20% of image width for large images
+LOGO_MARGIN = 10             # px margin from top-right
 
-# Image processing limits (تحسين الأداء)
-MAX_IMAGE_WIDTH  = 1280     # عرض أقصى للصورة قبل الإرسال
-MAX_IMAGE_HEIGHT = 1280     # ارتفاع أقصى
-JPEG_QUALITY     = 85       # جودة JPEG (قللها لو أردت ملفات أصغر)
+# Image processing limits
+MAX_IMAGE_WIDTH  = 1280
+MAX_IMAGE_HEIGHT = 1280
+JPEG_QUALITY     = 85
 HTTP_TIMEOUT     = 25
 
 # Logging
@@ -71,7 +71,7 @@ def daily_path(dt: datetime) -> Path:
     y, m, d = dt.year, dt.month, dt.day
     out_dir = DATA_BASE / f"{y}" / f"{m:02d}"
     ensure_dir(out_dir)
-    return out_dir / f"{d:02d}-{m:02d}.json"   # example: data/2025/11/09-11.json
+    return out_dir / f"{d:02d}-{m:02d}.json"   # e.g., data/2025/11/09-11.json
 
 def load_json_list(path: Path) -> list:
     if not path.exists():
@@ -98,8 +98,9 @@ def save_json_list(path: Path, data: list):
 # ====================
 def extract_full_text(entry) -> str:
     """
-    نص كامل بدون HTML:
-    - content:encoded (entry.content[0].value) أو description
+    Full text without HTML:
+    - prefer content:encoded (entry.content[0].value)
+    - fallback to description
     """
     try:
         if hasattr(entry, "content") and entry.content and isinstance(entry.content, list):
@@ -122,7 +123,7 @@ def extract_image(entry) -> str | None:
             return entry.media_thumbnail[0].get("url") or entry.media_thumbnail[0]["url"]
         except Exception:
             pass
-    # 2) من داخل المحتوى/الوصف
+    # 2) from content or description
     raw = ""
     try:
         if hasattr(entry, "content") and entry.content and isinstance(entry.content, list):
@@ -150,12 +151,11 @@ def extract_categories(entry) -> list:
 
 def build_daily_record(entry) -> dict:
     """
-    سجل اليوم كما اتفقنا:
+    Daily record (no id/author/published/language/url):
     - title
-    - description_full (نص كامل بدون HTML)
+    - description_full (plain text, full)
     - image
     - categories
-    (بدون id/author/published/language/url)
     """
     title = getattr(entry, "title", "") or ""
     description_full = extract_full_text(entry)
@@ -169,7 +169,7 @@ def build_daily_record(entry) -> dict:
     }
 
 def get_entry_identity(entry) -> tuple[str, str | None]:
-    """بصمة منع التكرار: (title + image)."""
+    """Dedup fingerprint: (title + image)."""
     title = getattr(entry, "title", "") or ""
     image = extract_image(entry)
     return (title.strip(), (image or "").strip())
@@ -183,18 +183,19 @@ def fetch_image(url: str) -> Image.Image | None:
         r = requests.get(url, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         im = Image.open(BytesIO(r.content))
-        # إصلاح اتجاه الصورة حسب EXIF
-        im = ImageOps.exif_transpose(im)
-        # اجعلها RGBA لتسهيل دمج الشعار
+        im = ImageOps.exif_transpose(im)  # fix orientation
         return im.convert("RGBA")
     except Exception as e:
         logging.error(f"fetch_image failed for {url}: {e}")
         return None
 
 def downscale_to_fit(im: Image.Image) -> Image.Image:
-    """تصغير الصورة إلى حدود القصوى مع الحفاظ على الأبعاد."""
     w, h = im.size
-    scale = min(MAX_IMAGE_WIDTH / w if w > 0 else 1, MAX_IMAGE_HEIGHT / h if h > 0 else 1, 1)
+    scale = min(
+        (MAX_IMAGE_WIDTH / w) if w > 0 else 1,
+        (MAX_IMAGE_HEIGHT / h) if h > 0 else 1,
+        1
+    )
     if scale < 1:
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
@@ -202,15 +203,9 @@ def downscale_to_fit(im: Image.Image) -> Image.Image:
     return im
 
 def overlay_logo(im: Image.Image) -> Image.Image:
-    """
-    دمج logo.png أعلى يمين الصورة مع حجم متكيف:
-    - لو الصورة صغيرة: LOGO_MIN_WIDTH_RATIO
-    - لو الصورة كبيرة: LOGO_MAX_WIDTH_RATIO
-    """
+    """Overlay logo top-right with adaptive size."""
     if not Path(LOGO_PATH).exists():
-        # لا يوجد شعار → أعد الصورة كما هي
         return im
-
     try:
         logo = Image.open(LOGO_PATH).convert("RGBA")
     except Exception as e:
@@ -218,14 +213,12 @@ def overlay_logo(im: Image.Image) -> Image.Image:
         return im
 
     pw, ph = im.size
-    # اختيار نسبة مناسبة حسب العرض
     lw_ratio = LOGO_MIN_WIDTH_RATIO if pw < 600 else LOGO_MAX_WIDTH_RATIO
     lw = int(max(1, min(pw - 2 * LOGO_MARGIN, pw * lw_ratio)))
     ratio = lw / logo.width
     lh = int(max(1, logo.height * ratio))
     logo_resized = logo.resize((lw, lh), Image.LANCZOS)
 
-    # لصق أعلى يمين
     x = pw - lw - LOGO_MARGIN
     y = LOGO_MARGIN
     im.paste(logo_resized, (x, y), logo_resized)
@@ -233,22 +226,20 @@ def overlay_logo(im: Image.Image) -> Image.Image:
 
 def process_image_with_logo(url: str) -> BytesIO | None:
     """
-    يحضّر الصورة للإرسال:
-    - تنزيل
-    - تصحيح اتجاه
-    - تصغير ذكي
-    - دمج الشعار
-    - إخراج JPEG بجودة محددة
+    - download
+    - exif transpose
+    - smart downscale
+    - overlay logo
+    - export JPEG
     """
     base = fetch_image(url)
     if base is None:
         return None
 
-    base = downscale_to_fit(base)       # تصغير إذا لزم
-    base = overlay_logo(base)           # دمج الشعار
+    base = downscale_to_fit(base)
+    base = overlay_logo(base)
 
     out = BytesIO()
-    # التحويل إلى RGB قبل الحفظ JPEG
     base.convert("RGB").save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
     out.seek(0)
     return out
@@ -259,9 +250,9 @@ def process_image_with_logo(url: str) -> BytesIO | None:
 # ====================
 def save_full_news_of_today(entries):
     """
-    - بناء سجلات اليوم (بدون id/author/published/language/url).
-    - منع التكرار عبر بصمة (title + image).
-    - إرجاع (added_records, path_str).
+    Build today's records (no id/author/published/language/url).
+    Dedup by (title + image).
+    Return (added_records, path_str).
     """
     today = now_local()
     path = daily_path(today)
@@ -332,11 +323,7 @@ def update_year_manifest(dt: datetime):
 
 
 # ====================
-# Global Index (search-friendly, without URL)
-#   - Split every 500 items: index_1.json, index_2.json, ...
-#   - Each item: title, image, categories (بدون url)
-#   - pagination.json: { total_articles, files: [...] }
-#   - stats.json: { total_articles, added_today, last_update }
+# Global Index (no URL)
 # ====================
 def gi_paths():
     ensure_dir(GLOBAL_INDEX)
@@ -407,9 +394,9 @@ def gi_append_records(new_records: list):
 
 def convert_full_to_slim(records: list) -> list:
     """
-    تحويل سجلات اليوم (title, description_full, image, categories)
-    إلى سجلات خفيفة للبحث:
-    - title, image, categories  (بدون url)
+    From daily records (title, description_full, image, categories)
+    to slim search records (no url):
+    - title, image, categories
     """
     out = []
     for r in records:
@@ -426,18 +413,18 @@ def convert_full_to_slim(records: list) -> list:
 # ====================
 async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
     """
-    أرسل حتى 4 عناصر جديدة:
-    - >=2 صور: ألبوم صور (media group) كل صورة مع عنوانها (مع شعار مدموج)
-    - 1 صورة: صورة واحدة مع العنوان
-    - 0 صور: قائمة نصية بالعناوين
-    (بدون روابط)
+    Send up to 4 new items:
+    - >=2 images: media group (album) with logo
+    - 1 image: a single photo with logo
+    - 0 images: text list of titles
+    (no links)
     """
     if not added_records:
         return
 
     candidates = added_records[:4]
 
-    # تجهيز الوسائط مع الشعار
+    # prepare media with logo
     media_list = []
     for rec in candidates:
         img_url = rec.get("image")
@@ -449,13 +436,11 @@ async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
         if processed:
             media_list.append(InputMediaPhoto(media=processed, caption=title))
         else:
-            # لو فشل المعالجة، جرّب الإرسال مباشرةً من URL
             media_list.append(InputMediaPhoto(media=img_url, caption=title))
 
         if len(media_list) >= 4:
             break
 
-    # >= 2 صور → ألبوم
     if len(media_list) >= 2:
         try:
             await bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=media_list)
@@ -463,7 +448,6 @@ async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
         except Exception as e:
             logging.error(f"send_media_group failed: {e}")
 
-    # صورة واحدة
     if len(media_list) == 1:
         try:
             await bot.send_photo(chat_id=TELEGRAM_CHAT_ID,
@@ -473,7 +457,7 @@ async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
         except Exception as e:
             logging.error(f"send_photo(single) failed: {e}")
 
-    # لا صور → نص فقط
+    # no images → text only
     lines = [f"• {rec.get('title')}" for rec in candidates]
     text = "📰 أحدث أخبار الأنمي من Crunchyroll\n\n" + "\n".join(lines)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
@@ -481,9 +465,9 @@ async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
 
 async def send_youtube_if_new(bot: telegram.Bot):
     """
-    إرسال أحدث فيديو يوتيوب إن كان جديدًا:
-    - لا تخزين داخل data/
-    - حفظ ID داخل sent_videos.txt
+    Send latest YouTube video if new:
+    - no data/ storage
+    - prepend id to sent_videos.txt
     """
     feed = feedparser.parse(YOUTUBE_RSS_URL)
     if not feed.entries:
@@ -497,7 +481,6 @@ async def send_youtube_if_new(bot: telegram.Bot):
     if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
         thumb = entry.media_thumbnail[0].get("url")
 
-    # اقرأ أول سطر من sent_videos.txt
     if not YOUTUBE_SENT_FILE.exists():
         YOUTUBE_SENT_FILE.write_text("", encoding="utf-8")
         last = None
@@ -518,7 +501,6 @@ async def send_youtube_if_new(bot: telegram.Bot):
         logging.error(f"Failed to send YouTube: {e}")
         return
 
-    # prepend id
     try:
         old = ""
         if YOUTUBE_SENT_FILE.exists():
@@ -547,21 +529,21 @@ async def run():
         added_records, day_path = save_full_news_of_today(news_feed.entries)
         logging.info(f"Crun: added {len(added_records)} new record(s) to {day_path}")
 
-        # أرسل حتى 4 عناصر جديدة (عنوان + صورة مع شعار)
+        # send up to 4 new items (with logo)
         await send_crunchyroll_album(bot, added_records)
 
-        # تحديث الفهارس
+        # manifests
         today = now_local()
         update_month_manifest(today)
         update_year_manifest(today)
 
-        # تحديث global_index (بدون URL)
+        # global index (no URL)
         slim = convert_full_to_slim(added_records)
         gi_append_records(slim)
     else:
         logging.warning("No entries in Crunchyroll feed.")
 
-    # 2) YouTube (إرسال فقط)
+    # 2) YouTube (send-only)
     await send_youtube_if_new(bot)
 
 if __name__ == "__main__":
