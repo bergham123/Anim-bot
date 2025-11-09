@@ -4,13 +4,20 @@ import json
 import asyncio
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import feedparser
 from bs4 import BeautifulSoup
+
+# Telegram
 import telegram
 from telegram import InputMediaPhoto
+
+# Pillow + HTTP
+from PIL import Image, ImageOps
+from io import BytesIO
+import requests
 
 # ====================
 # CONFIG
@@ -34,6 +41,18 @@ GLOBAL_INDEX = Path("global_index")    # index_1.json, pagination.json, stats.js
 
 # Global Index settings
 GLOBAL_PAGE_SIZE = 500
+
+# Logo overlay settings
+LOGO_PATH = "logo.png"
+LOGO_MIN_WIDTH_RATIO = 0.10  # 10% من عرض الصورة للصورة الصغيرة
+LOGO_MAX_WIDTH_RATIO = 0.20  # 20% من عرض الصورة للصورة الكبيرة
+LOGO_MARGIN = 10             # هامش من أعلى اليمين بالبكسل
+
+# Image processing limits (تحسين الأداء)
+MAX_IMAGE_WIDTH  = 1280     # عرض أقصى للصورة قبل الإرسال
+MAX_IMAGE_HEIGHT = 1280     # ارتفاع أقصى
+JPEG_QUALITY     = 85       # جودة JPEG (قللها لو أردت ملفات أصغر)
+HTTP_TIMEOUT     = 25
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -79,12 +98,9 @@ def save_json_list(path: Path, data: list):
 # ====================
 def extract_full_text(entry) -> str:
     """
-    يرجع النص الكامل للمقال (بدون HTML):
-    - يفضّل content:encoded (entry.content[0].value)
-    - وإلا يستخدم description
-    - ثم ينظّف كل الوسوم
+    نص كامل بدون HTML:
+    - content:encoded (entry.content[0].value) أو description
     """
-    # 1) content:encoded
     try:
         if hasattr(entry, "content") and entry.content and isinstance(entry.content, list):
             raw = entry.content[0].get("value") or ""
@@ -93,7 +109,6 @@ def extract_full_text(entry) -> str:
     except Exception:
         pass
 
-    # 2) description
     raw = getattr(entry, "description", "") or ""
     if raw:
         return BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)
@@ -135,9 +150,9 @@ def extract_categories(entry) -> list:
 
 def build_daily_record(entry) -> dict:
     """
-    سجل اليوم كما طلبت:
+    سجل اليوم كما اتفقنا:
     - title
-    - description_full: النص الكامل بلا HTML (من content:encoded إن وُجد)
+    - description_full (نص كامل بدون HTML)
     - image
     - categories
     (بدون id/author/published/language/url)
@@ -154,13 +169,89 @@ def build_daily_record(entry) -> dict:
     }
 
 def get_entry_identity(entry) -> tuple[str, str | None]:
-    """
-    بصمة منع التكرار: (title + image)
-    لا نخزّنها في الملف، تُستخدم فقط للمقارنة.
-    """
+    """بصمة منع التكرار: (title + image)."""
     title = getattr(entry, "title", "") or ""
     image = extract_image(entry)
     return (title.strip(), (image or "").strip())
+
+
+# ====================
+# Image processing (logo + resize)
+# ====================
+def fetch_image(url: str) -> Image.Image | None:
+    try:
+        r = requests.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        im = Image.open(BytesIO(r.content))
+        # إصلاح اتجاه الصورة حسب EXIF
+        im = ImageOps.exif_transpose(im)
+        # اجعلها RGBA لتسهيل دمج الشعار
+        return im.convert("RGBA")
+    except Exception as e:
+        logging.error(f"fetch_image failed for {url}: {e}")
+        return None
+
+def downscale_to_fit(im: Image.Image) -> Image.Image:
+    """تصغير الصورة إلى حدود القصوى مع الحفاظ على الأبعاد."""
+    w, h = im.size
+    scale = min(MAX_IMAGE_WIDTH / w if w > 0 else 1, MAX_IMAGE_HEIGHT / h if h > 0 else 1, 1)
+    if scale < 1:
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        im = im.resize((new_w, new_h), Image.LANCZOS)
+    return im
+
+def overlay_logo(im: Image.Image) -> Image.Image:
+    """
+    دمج logo.png أعلى يمين الصورة مع حجم متكيف:
+    - لو الصورة صغيرة: LOGO_MIN_WIDTH_RATIO
+    - لو الصورة كبيرة: LOGO_MAX_WIDTH_RATIO
+    """
+    if not Path(LOGO_PATH).exists():
+        # لا يوجد شعار → أعد الصورة كما هي
+        return im
+
+    try:
+        logo = Image.open(LOGO_PATH).convert("RGBA")
+    except Exception as e:
+        logging.error(f"Failed to open logo: {e}")
+        return im
+
+    pw, ph = im.size
+    # اختيار نسبة مناسبة حسب العرض
+    lw_ratio = LOGO_MIN_WIDTH_RATIO if pw < 600 else LOGO_MAX_WIDTH_RATIO
+    lw = int(max(1, min(pw - 2 * LOGO_MARGIN, pw * lw_ratio)))
+    ratio = lw / logo.width
+    lh = int(max(1, logo.height * ratio))
+    logo_resized = logo.resize((lw, lh), Image.LANCZOS)
+
+    # لصق أعلى يمين
+    x = pw - lw - LOGO_MARGIN
+    y = LOGO_MARGIN
+    im.paste(logo_resized, (x, y), logo_resized)
+    return im
+
+def process_image_with_logo(url: str) -> BytesIO | None:
+    """
+    يحضّر الصورة للإرسال:
+    - تنزيل
+    - تصحيح اتجاه
+    - تصغير ذكي
+    - دمج الشعار
+    - إخراج JPEG بجودة محددة
+    """
+    base = fetch_image(url)
+    if base is None:
+        return None
+
+    base = downscale_to_fit(base)       # تصغير إذا لزم
+    base = overlay_logo(base)           # دمج الشعار
+
+    out = BytesIO()
+    # التحويل إلى RGB قبل الحفظ JPEG
+    base.convert("RGB").save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    out.seek(0)
+    return out
 
 
 # ====================
@@ -168,15 +259,14 @@ def get_entry_identity(entry) -> tuple[str, str | None]:
 # ====================
 def save_full_news_of_today(entries):
     """
-    - يبني سجلات اليوم بالشكل المطلوب (بدون id/author/published/language/url).
-    - يمنع التكرار عبر بصمة (title + image) مقارنة بمحتوى اليوم الحالي.
-    - يرجع (added_records, path_str).
+    - بناء سجلات اليوم (بدون id/author/published/language/url).
+    - منع التكرار عبر بصمة (title + image).
+    - إرجاع (added_records, path_str).
     """
     today = now_local()
     path = daily_path(today)
     existing = load_json_list(path)
 
-    # بصمات الموجودين: title|image
     def fp_from_item(item: dict) -> str:
         return f"{(item.get('title') or '').strip()}|{(item.get('image') or '').strip()}"
 
@@ -337,7 +427,7 @@ def convert_full_to_slim(records: list) -> list:
 async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
     """
     أرسل حتى 4 عناصر جديدة:
-    - >=2 صور: ألبوم صور (media group) كل صورة مع عنوانها
+    - >=2 صور: ألبوم صور (media group) كل صورة مع عنوانها (مع شعار مدموج)
     - 1 صورة: صورة واحدة مع العنوان
     - 0 صور: قائمة نصية بالعناوين
     (بدون روابط)
@@ -347,29 +437,43 @@ async def send_crunchyroll_album(bot: telegram.Bot, added_records: list):
 
     candidates = added_records[:4]
 
-    # جهّز الصور
-    photos = []
+    # تجهيز الوسائط مع الشعار
+    media_list = []
     for rec in candidates:
-        if rec.get("image"):
-            photos.append(InputMediaPhoto(media=rec["image"], caption=(rec.get("title") or "")))
+        img_url = rec.get("image")
+        title   = rec.get("title") or ""
+        if not img_url:
+            continue
+
+        processed = process_image_with_logo(img_url)
+        if processed:
+            media_list.append(InputMediaPhoto(media=processed, caption=title))
+        else:
+            # لو فشل المعالجة، جرّب الإرسال مباشرةً من URL
+            media_list.append(InputMediaPhoto(media=img_url, caption=title))
+
+        if len(media_list) >= 4:
+            break
 
     # >= 2 صور → ألبوم
-    if len(photos) >= 2:
+    if len(media_list) >= 2:
         try:
-            await bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=photos)
+            await bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=media_list)
             return
         except Exception as e:
             logging.error(f"send_media_group failed: {e}")
 
-    # صورة واحدة فقط
-    if len(photos) == 1:
+    # صورة واحدة
+    if len(media_list) == 1:
         try:
-            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photos[0].media, caption=photos[0].caption)
+            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID,
+                                 photo=media_list[0].media,
+                                 caption=media_list[0].caption)
             return
         except Exception as e:
-            logging.error(f"send_photo failed: {e}")
+            logging.error(f"send_photo(single) failed: {e}")
 
-    # بدون صور → نص
+    # لا صور → نص فقط
     lines = [f"• {rec.get('title')}" for rec in candidates]
     text = "📰 أحدث أخبار الأنمي من Crunchyroll\n\n" + "\n".join(lines)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
@@ -443,7 +547,7 @@ async def run():
         added_records, day_path = save_full_news_of_today(news_feed.entries)
         logging.info(f"Crun: added {len(added_records)} new record(s) to {day_path}")
 
-        # أرسل حتى 4 عناصر جديدة (عنوان + صورة فقط)
+        # أرسل حتى 4 عناصر جديدة (عنوان + صورة مع شعار)
         await send_crunchyroll_album(bot, added_records)
 
         # تحديث الفهارس
